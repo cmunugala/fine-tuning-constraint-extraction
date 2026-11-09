@@ -24,19 +24,20 @@ class Scenario:
 
 def random_reference_date(rng: random.Random) -> date:
     start = date(2025, 1, 1)
-    return start + timedelta(days=rng.randrange((date(2027, 12, 31) - start).days + 1))
+    return start + timedelta(days=rng.randrange((date(2028, 12, 31) - start).days + 1))
 
 
 def choose_priority(constraint_type: str, rng: random.Random) -> str:
+    if constraint_type == "available":
+        return "hard"
     if constraint_type == "preferred_hours":
         return "soft"
     soft_probability = {
-        "unavailable": 0.24,
-        "available": 0.18,
-        "min_weekly_hours": 0.15,
-        "max_weekly_hours": 0.18,
-        "max_consecutive_days": 0.08,
-        "min_rest_hours": 0.08,
+        "unavailable": 0.28,
+        "min_weekly_hours": 0.25,
+        "max_weekly_hours": 0.25,
+        "max_consecutive_days": 0.22,
+        "min_rest_hours": 0.22,
     }[constraint_type]
     return "soft" if rng.random() < soft_probability else "hard"
 
@@ -79,9 +80,10 @@ def _time_scope(
     end_time: time | None = None
     if constraint_type in {"available", "preferred_hours"}:
         start_hour = rng.choice([6, 7, 8, 9, 10, 11, 12, 13, 14])
+        start_minute = rng.choices([0, 30], weights=[4, 1], k=1)[0]
         duration = rng.choice([3, 4, 5, 6, 7, 8])
-        start_time = time(start_hour)
-        end_time = time(min(start_hour + duration, 22))
+        start_time = time(start_hour, start_minute)
+        end_time = time(min(start_hour + duration, 22), start_minute)
     else:
         time_pattern = rng.choices(
             ["full_day", "after", "before", "range"],
@@ -89,13 +91,14 @@ def _time_scope(
             k=1,
         )[0]
         if time_pattern == "after":
-            start_time = time(rng.choice([12, 14, 15, 16, 17, 18, 19]))
+            start_time = time(rng.choice([12, 14, 15, 16, 17, 18, 19]), rng.choice([0, 0, 30]))
         elif time_pattern == "before":
-            end_time = time(rng.choice([8, 9, 10, 11, 12, 13]))
+            end_time = time(rng.choice([8, 9, 10, 11, 12, 13]), rng.choice([0, 0, 30]))
         elif time_pattern == "range":
             start_hour = rng.choice([6, 7, 8, 9, 10, 12, 14, 16])
-            start_time = time(start_hour)
-            end_time = time(min(start_hour + rng.choice([3, 4, 5, 6]), 22))
+            minute = rng.choice([0, 0, 30])
+            start_time = time(start_hour, minute)
+            end_time = time(min(start_hour + rng.choice([3, 4, 5, 6]), 22), minute)
 
     return TimeScope(
         days_of_week=days,
@@ -139,10 +142,10 @@ def make_constraint(
 
     if value is None:
         choices = {
-            "min_weekly_hours": [12, 16, 20, 24, 28, 30, 32],
-            "max_weekly_hours": [20, 24, 28, 30, 32, 36, 40],
-            "max_consecutive_days": [2, 3, 4, 5, 6],
-            "min_rest_hours": [8, 10, 11, 12, 14, 16],
+            "min_weekly_hours": [8, 10, 12, 15, 16, 18, 20, 22, 24, 25, 28, 30, 32, 35],
+            "max_weekly_hours": [16, 20, 24, 25, 28, 30, 32, 35, 36, 38, 40, 45, 48],
+            "max_consecutive_days": [2, 3, 4, 5, 6, 7],
+            "min_rest_hours": [8, 9, 10, 11, 12, 13, 14, 16],
         }
         value = float(rng.choice(choices[constraint_type]))
     return SchedulingConstraint(
@@ -175,7 +178,23 @@ def make_scenario(
         employee = rng.choice(NAMES)
         employees = [employee] * len(constraint_types)
 
-    styles = scope_styles or tuple(None for _ in constraint_types)
+    styles: list[ScopeStyle | None] = list(
+        scope_styles or tuple(None for _ in constraint_types)
+    )
+    if scope_styles is None and len(constraint_types) == 3:
+        # Multiple bounded temporal clauses produce needlessly long examples.
+        # Keep at most one while retaining all three temporal semantics.
+        bounded_used = False
+        for index, constraint_type in enumerate(constraint_types):
+            if constraint_type not in TEMPORAL_TYPES:
+                continue
+            selected = rng.choices(
+                ["recurring", "one_off", "bounded"], weights=[55, 25, 20], k=1
+            )[0]
+            if selected == "bounded" and bounded_used:
+                selected = "recurring"
+            bounded_used = bounded_used or selected == "bounded"
+            styles[index] = selected
     requested_priorities = priorities or tuple(None for _ in constraint_types)
     offsets = one_off_offsets or tuple(None for _ in constraint_types)
     temporal_index = 0
@@ -185,8 +204,8 @@ def make_scenario(
     min_hours: float | None = None
     max_hours: float | None = None
     if "min_weekly_hours" in constraint_types and "max_weekly_hours" in constraint_types:
-        min_hours = float(rng.choice([12, 16, 20, 24, 28]))
-        max_hours = float(rng.choice([value for value in [24, 28, 30, 32, 36, 40] if value > min_hours]))
+        min_hours = float(rng.choice([8, 10, 12, 15, 16, 18, 20, 22, 24, 25, 28, 30, 32]))
+        max_hours = float(rng.choice([value for value in [16, 20, 24, 25, 28, 30, 32, 35, 36, 38, 40, 45, 48] if value > min_hours]))
 
     for index, constraint_type in enumerate(constraint_types):
         forced_day = None

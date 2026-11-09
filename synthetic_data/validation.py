@@ -11,7 +11,7 @@ from typing import Any, Iterable
 
 from models import SchedulingOutput
 
-from .catalog import HELD_OUT_KEYS, TEMPORAL_TYPES, WEEKLY_TYPES, combination_key
+from .catalog import TEMPORAL_TYPES, WEEKLY_TYPES
 
 
 def canonical_label(label: dict[str, Any]) -> str:
@@ -26,12 +26,48 @@ def normalized_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
+def request_skeleton(record: dict[str, Any]) -> str:
+    """Normalize generated slot values while preserving linguistic structure."""
+
+    text = normalized_text(record["text"])
+    employees = {
+        constraint.get("employee")
+        for constraint in record["label"]["constraints"]
+        if constraint.get("employee")
+    }
+    for employee in sorted(employees, key=len, reverse=True):
+        text = re.sub(re.escape(employee.lower()), "<employee>", text)
+    text = text.replace("everyone on the team", "<employee>")
+    text = text.replace("each team member", "<employee>")
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "<date>", text)
+    text = re.sub(r"\b\d{1,2}/\d{1,2}/\d{4}\b", "<date>", text)
+    months = (
+        "january|february|march|april|may|june|july|august|september|"
+        "october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec"
+    )
+    text = re.sub(rf"\b(?:{months})\s+\d{{1,2}},\s+\d{{4}}\b", "<date>", text)
+    text = re.sub(
+        r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"mons?|tues?|weds?|thus?|fris?|sats?|suns?)\b",
+        "<day>",
+        text,
+    )
+    text = re.sub(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", "<time>", text)
+    text = re.sub(r"\b\d{1,2}\s*(?:am|pm)\b", "<time>", text)
+    text = re.sub(r"\b\d+(?:\.\d+)?\b", "<number>", text)
+    return re.sub(r"\s+", " ", text)
+
+
 def validate_output(output: SchedulingOutput) -> None:
     if not output.constraints:
         raise ValueError("A label must contain at least one constraint")
 
     weekly: dict[str | None, dict[str, float]] = {}
     for constraint in output.constraints:
+        if constraint.type == "available" and constraint.priority != "hard":
+            raise ValueError("available constraints must be hard")
+        if constraint.type == "preferred_hours" and constraint.priority != "soft":
+            raise ValueError("preferred_hours constraints must be soft")
         if constraint.type in TEMPORAL_TYPES:
             if constraint.time_scope is None:
                 raise ValueError(f"{constraint.type} requires time_scope")
@@ -89,6 +125,8 @@ def audit_splits(
     text_owners: dict[str, str] = {}
     label_owners: dict[str, str] = {}
     type_counts: Counter[str] = Counter()
+    priority_counts: Counter[str] = Counter()
+    skeleton_counts: Counter[str] = Counter()
 
     for split, records in records_by_split.items():
         outputs = validate_records(records)
@@ -102,30 +140,31 @@ def audit_splits(
             text_owners[text_fp] = split
             label_owners[label_fp] = split
             type_counts.update(item.type for item in output.constraints)
+            priority_counts.update(item.priority for item in output.constraints)
+            skeleton_counts[request_skeleton(record)] += 1
 
-            key = combination_key([item.type for item in output.constraints])
-            if split in {"train", "validation"} and key in HELD_OUT_KEYS:
-                raise ValueError(f"Held-out combination leaked into {split}: {key}")
-
+    style_counts: Counter[str] = Counter()
     if metadata_by_split is not None:
-        template_owners: dict[str, str] = {}
         for split, metadata in metadata_by_split.items():
+            if len(metadata) != len(records_by_split[split]):
+                raise ValueError(f"Metadata length does not match records for {split}")
             for item in metadata:
-                for template_id in item["template_ids"]:
-                    prefix = template_id.split(":", 1)[0]
-                    if prefix != split:
-                        raise ValueError(
-                            f"Template {template_id!r} used in the wrong split {split!r}"
-                        )
-                    previous = template_owners.setdefault(template_id, split)
-                    if previous != split:
-                        raise ValueError(
-                            f"Template {template_id!r} shared by {previous} and {split}"
-                        )
+                style_counts[item["style"]] += 1
 
-    return {
+    result = {
         "counts": {split: len(records) for split, records in records_by_split.items()},
         "constraint_type_counts": dict(sorted(type_counts.items())),
+        "constraint_priority_counts": dict(sorted(priority_counts.items())),
         "unique_texts": len(text_owners),
         "unique_labels": len(label_owners),
+        "unique_text_skeletons": len(skeleton_counts),
+        "max_text_skeleton_count": max(skeleton_counts.values(), default=0),
+        "max_text_skeleton_share": (
+            max(skeleton_counts.values(), default=0) / len(text_owners)
+            if text_owners
+            else 0.0
+        ),
     }
+    if metadata_by_split is not None:
+        result["render_style_counts"] = dict(sorted(style_counts.items()))
+    return result

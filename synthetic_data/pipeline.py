@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from datetime import date
 import json
 import math
@@ -14,13 +13,12 @@ from typing import Any
 
 from .catalog import (
     CONSTRAINT_TYPES,
-    HELD_OUT_COMBINATIONS,
-    SEEN_COMBINATIONS,
-    TYPE_WEIGHTS,
+    PAIR_COMBINATIONS,
+    TRIPLE_COMBINATIONS,
     combination_key,
 )
 from .generation import Scenario, make_scenario
-from .rendering import assert_template_banks_disjoint, render_scenario
+from .rendering import render_scenario
 from .validation import (
     audit_splits,
     canonical_label,
@@ -31,7 +29,7 @@ from .validation import (
 )
 
 DEFAULT_SEED = 20261102
-DEFAULT_SIZES = {"train": 1000, "validation": 150, "test": 200}
+DEFAULT_SIZES = {"train": 1000, "validation": 175, "test": 175}
 SPLIT_FILENAMES = {
     "train": "train.jsonl",
     "validation": "val.jsonl",
@@ -39,8 +37,10 @@ SPLIT_FILENAMES = {
 }
 
 
-def _record(scenario: Scenario, split: str, rng: random.Random) -> tuple[dict[str, Any], dict[str, Any]]:
-    text, template_ids = render_scenario(scenario, split, rng)
+def _record(
+    scenario: Scenario, rng: random.Random
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    text, render_ids, style = render_scenario(scenario, rng)
     label = scenario.output.model_dump(mode="json", exclude_none=True)
     record = {
         "text": text,
@@ -49,54 +49,55 @@ def _record(scenario: Scenario, split: str, rng: random.Random) -> tuple[dict[st
     }
     validate_record(record)
     metadata = {
-        "template_ids": list(template_ids),
+        "render_ids": list(render_ids),
+        "style": style,
         "combination": list(combination_key([item.type for item in scenario.output.constraints])),
     }
     return record, metadata
 
 
-def _weighted_single(rng: random.Random) -> tuple[str, ...]:
-    return (rng.choices(CONSTRAINT_TYPES, weights=TYPE_WEIGHTS, k=1)[0],)
+def _cycled_plans(
+    combinations: tuple[tuple[str, ...], ...], count: int
+) -> list[tuple[str, ...]]:
+    return [combinations[index % len(combinations)] for index in range(count)]
 
 
-def _plans_for_split(split: str, size: int, rng: random.Random) -> list[tuple[str, ...]]:
+def _plans_for_pool(size: int, rng: random.Random) -> list[tuple[str, ...]]:
     single_count = math.floor(size * 0.55 + 0.5)
-    multi_count = size - single_count
-    plans = [_weighted_single(rng) for _ in range(single_count)]
-
-    held_out_count = min(multi_count, math.floor(size * 0.30 + 0.5)) if split == "test" else 0
-    for index in range(held_out_count):
-        plans.append(HELD_OUT_COMBINATIONS[index % len(HELD_OUT_COMBINATIONS)])
-    for index in range(multi_count - held_out_count):
-        # Cycling guarantees every known combination appears in sufficiently large splits.
-        plans.append(SEEN_COMBINATIONS[index % len(SEEN_COMBINATIONS)])
+    double_count = math.floor(size * 0.27 + 0.5)
+    triple_count = size - single_count - double_count
+    singles = tuple((constraint_type,) for constraint_type in CONSTRAINT_TYPES)
+    plans = _cycled_plans(singles, single_count)
+    plans.extend(_cycled_plans(PAIR_COMBINATIONS, double_count))
+    plans.extend(_cycled_plans(TRIPLE_COMBINATIONS, triple_count))
     rng.shuffle(plans)
     return plans
 
 
-def _generate_split(
-    split: str,
+def _generate_pool(
     size: int,
     rng: random.Random,
-    used_texts: set[str],
-    used_labels: set[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records: list[dict[str, Any]] = []
     metadata: list[dict[str, Any]] = []
-    plans = _plans_for_split(split, size, rng)
+    plans = _plans_for_pool(size, rng)
+    used_texts: set[str] = set()
+    used_labels: set[str] = set()
 
     for types in plans:
         accepted = False
-        for _ in range(250):
+        for _ in range(500):
             team_wide = rng.random() < 0.10
-            multiple_employees = len(types) > 1 and not team_wide and rng.random() < 0.10
+            multiple_employees = (
+                len(types) > 1 and not team_wide and rng.random() < 0.15
+            )
             scenario = make_scenario(
                 types,
                 rng,
                 team_wide=team_wide,
                 multiple_employees=multiple_employees,
             )
-            record, item_metadata = _record(scenario, split, rng)
+            record, item_metadata = _record(scenario, rng)
             text_fp = fingerprint(normalized_text(record["text"]))
             label_fp = fingerprint(canonical_label(record["label"]))
             if text_fp in used_texts or label_fp in used_labels:
@@ -108,7 +109,7 @@ def _generate_split(
             accepted = True
             break
         if not accepted:
-            raise RuntimeError(f"Could not generate a unique {split} record for {types}")
+            raise RuntimeError(f"Could not generate a unique pooled record for {types}")
     return records, metadata
 
 
@@ -147,7 +148,6 @@ PREVIEW_PLANS: tuple[dict[str, Any], ...] = (
 
 
 def build_preview(seed: int = DEFAULT_SEED) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    assert_template_banks_disjoint()
     rng = random.Random(seed)
     records: list[dict[str, Any]] = []
     metadata: list[dict[str, Any]] = []
@@ -167,7 +167,7 @@ def build_preview(seed: int = DEFAULT_SEED) -> tuple[list[dict[str, Any]], dict[
             priorities=plan.get("priorities"),
             one_off_offsets=plan.get("date_offsets"),
         )
-        record, item_metadata = _record(scenario, "preview", rng)
+        record, item_metadata = _record(scenario, rng)
         text_fp = fingerprint(normalized_text(record["text"]))
         label_fp = fingerprint(canonical_label(record["label"]))
         if text_fp in used_texts or label_fp in used_labels:
@@ -183,8 +183,8 @@ def build_preview(seed: int = DEFAULT_SEED) -> tuple[list[dict[str, Any]], dict[
         "seed": seed,
         "schema_model": "models.SchedulingOutput",
         "status": "awaiting_manual_approval",
-        "unique_template_ids": len(
-            {template_id for item in metadata for template_id in item["template_ids"]}
+        "unique_render_components": len(
+            {render_id for item in metadata for render_id in item["render_ids"]}
         ),
         **stats,
     }
@@ -194,54 +194,55 @@ def build_full_dataset(
     seed: int = DEFAULT_SEED,
     sizes: dict[str, int] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    assert_template_banks_disjoint()
     sizes = dict(sizes or DEFAULT_SIZES)
     if set(sizes) != {"train", "validation", "test"}:
         raise ValueError("sizes must define train, validation, and test")
-    rng = random.Random(seed)
+    if any(size <= 0 for size in sizes.values()):
+        raise ValueError("split sizes must be positive")
+
+    pool_size = sum(sizes.values())
+    records, metadata = _generate_pool(pool_size, random.Random(seed))
+    indices = list(range(pool_size))
+    split_seed = seed ^ 0x5DEECE66D
+    random.Random(split_seed).shuffle(indices)
+
     records_by_split: dict[str, list[dict[str, Any]]] = {}
     metadata_by_split: dict[str, list[dict[str, Any]]] = {}
-    used_texts: set[str] = set()
-    used_labels: set[str] = set()
-
+    offset = 0
     for split in ("train", "validation", "test"):
-        records, metadata = _generate_split(
-            split, sizes[split], rng, used_texts, used_labels
-        )
-        records_by_split[split] = records
-        metadata_by_split[split] = metadata
+        selected = indices[offset : offset + sizes[split]]
+        records_by_split[split] = [records[index] for index in selected]
+        metadata_by_split[split] = [metadata[index] for index in selected]
+        offset += sizes[split]
 
     stats = audit_splits(records_by_split, metadata_by_split)
-    held_out_test_count = sum(
-        combination_key(item["combination"])
-        in {combination_key(combo) for combo in HELD_OUT_COMBINATIONS}
-        for item in metadata_by_split["test"]
-    )
+    if pool_size >= 1000 and stats["unique_text_skeletons"] < 200:
+        raise RuntimeError("Generated pool has fewer than 200 text skeletons")
+    if pool_size >= 1000 and stats["max_text_skeleton_share"] > 0.02:
+        raise RuntimeError("A text skeleton exceeds 2% of the generated pool")
+
     manifest = {
         "dataset": "scheduling_constraints",
         "seed": seed,
+        "pool_size": pool_size,
         "schema_model": "models.SchedulingOutput",
         "row_fields": ["text", "reference_date", "label"],
         "null_fields_omitted": True,
         "split_policy": {
+            "method": "seeded_random_shuffle",
+            "stratified": False,
+            "split_seed": split_seed,
             "single_constraint_ratio": 0.55,
-            "test_held_out_combination_ratio": 0.30,
-            "held_out_combinations": [list(item) for item in HELD_OUT_COMBINATIONS],
-            "held_out_test_examples": held_out_test_count,
+            "double_constraint_ratio": 0.27,
+            "triple_constraint_ratio": 0.18,
+            "shared_language_distribution": True,
         },
-        "template_banks": {
-            split: {
-                "id_prefix": split,
-                "unique_template_ids": len(
-                    {
-                        template_id
-                        for item in metadata_by_split[split]
-                        for template_id in item["template_ids"]
-                    }
-                ),
-            }
-            for split in ("train", "validation", "test")
-        },
+        "unique_render_components": len(
+            {render_id for item in metadata for render_id in item["render_ids"]}
+        ),
+        "constraint_combinations": len(
+            {tuple(item["combination"]) for item in metadata}
+        ),
         "record_shapes": {
             split: {
                 "single_constraint": sum(

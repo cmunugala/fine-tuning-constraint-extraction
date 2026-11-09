@@ -2,26 +2,25 @@ from __future__ import annotations
 
 from datetime import date, time
 from pathlib import Path
+import random
 import tempfile
 import unittest
 
 from models import SchedulingConstraint, SchedulingOutput, TimeScope
-from synthetic_data.catalog import HELD_OUT_KEYS, combination_key
+from synthetic_data.catalog import CONSTRAINT_TYPES
+from synthetic_data.generation import make_scenario
 from synthetic_data.pipeline import (
+    DEFAULT_SIZES,
     build_full_dataset,
     build_preview,
     write_full_dataset,
     write_preview,
 )
-from synthetic_data.generation import make_scenario
-from synthetic_data.rendering import assert_template_banks_disjoint, render_scenario
+from synthetic_data.rendering import STYLES, render_scenario
 from synthetic_data.validation import audit_splits, validate_output
 
 
 class SyntheticDataTests(unittest.TestCase):
-    def test_template_banks_are_disjoint(self) -> None:
-        assert_template_banks_disjoint()
-
     def test_preview_is_deterministic_and_representative(self) -> None:
         first, manifest = build_preview(123)
         second, _ = build_preview(123)
@@ -33,31 +32,50 @@ class SyntheticDataTests(unittest.TestCase):
             for record in first
             for constraint in record["label"]["constraints"]
         }
-        self.assertEqual(len(types), 7)
+        self.assertEqual(types, set(CONSTRAINT_TYPES))
         self.assertTrue(any(len(row["label"]["constraints"]) > 1 for row in first))
         self.assertTrue(
-            any("employee" not in item for row in first for item in row["label"]["constraints"])
-        )
-        self.assertTrue(any("tomorrow" in row["text"].lower() for row in first))
-
-    def test_small_full_dataset_has_no_leakage(self) -> None:
-        sizes = {"train": 40, "validation": 20, "test": 20}
-        records, manifest = build_full_dataset(456, sizes)
-        self.assertEqual(manifest["counts"], sizes)
-        self.assertEqual(audit_splits(records)["counts"], sizes)
-        for split in ("train", "validation"):
-            for row in records[split]:
-                key = combination_key(
-                    [item["type"] for item in row["label"]["constraints"]]
-                )
-                self.assertNotIn(key, HELD_OUT_KEYS)
-        self.assertTrue(
             any(
-                combination_key([item["type"] for item in row["label"]["constraints"]])
-                in HELD_OUT_KEYS
-                for row in records["test"]
+                "employee" not in item
+                for row in first
+                for item in row["label"]["constraints"]
             )
         )
+
+    def test_pool_is_generated_before_seeded_random_split(self) -> None:
+        sizes = {"train": 40, "validation": 20, "test": 20}
+        first, manifest = build_full_dataset(456, sizes)
+        second, second_manifest = build_full_dataset(456, sizes)
+        different, _ = build_full_dataset(457, sizes)
+
+        self.assertEqual(first, second)
+        self.assertEqual(manifest, second_manifest)
+        self.assertNotEqual(first, different)
+        self.assertEqual(manifest["counts"], sizes)
+        self.assertEqual(manifest["pool_size"], 80)
+        self.assertEqual(manifest["split_policy"]["method"], "seeded_random_shuffle")
+        self.assertFalse(manifest["split_policy"]["stratified"])
+        self.assertTrue(manifest["split_policy"]["shared_language_distribution"])
+        self.assertEqual(audit_splits(first)["unique_texts"], 80)
+        self.assertEqual(audit_splits(first)["unique_labels"], 80)
+
+    def test_full_default_dataset_meets_diversity_requirements(self) -> None:
+        records, manifest = build_full_dataset(789)
+        self.assertEqual(manifest["counts"], DEFAULT_SIZES)
+        self.assertEqual(manifest["pool_size"], 1350)
+        self.assertGreaterEqual(manifest["unique_text_skeletons"], 200)
+        self.assertLessEqual(manifest["max_text_skeleton_share"], 0.02)
+        self.assertEqual(manifest["constraint_combinations"], 63)
+        self.assertEqual(set(manifest["render_style_counts"]), set(STYLES))
+        self.assertEqual(set(manifest["constraint_priority_counts"]), {"hard", "soft"})
+
+        for rows in records.values():
+            for row in rows:
+                for constraint in row["label"]["constraints"]:
+                    if constraint["type"] == "available":
+                        self.assertEqual(constraint["priority"], "hard")
+                    if constraint["type"] == "preferred_hours":
+                        self.assertEqual(constraint["priority"], "soft")
 
     def test_semantic_validation_rejects_reversed_times(self) -> None:
         output = SchedulingOutput(
@@ -77,9 +95,36 @@ class SyntheticDataTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "start_time"):
             validate_output(output)
 
-    def test_relative_dates_cross_year_and_leap_day(self) -> None:
-        import random
+    def test_availability_and_preference_semantics_are_enforced(self) -> None:
+        scope = TimeScope(days_of_week=["monday"], recurring=True)
+        with self.assertRaisesRegex(ValueError, "available constraints must be hard"):
+            validate_output(
+                SchedulingOutput(
+                    constraints=[
+                        SchedulingConstraint(
+                            employee="Sam",
+                            type="available",
+                            priority="soft",
+                            time_scope=scope,
+                        )
+                    ]
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "preferred_hours constraints must be soft"):
+            validate_output(
+                SchedulingOutput(
+                    constraints=[
+                        SchedulingConstraint(
+                            employee="Sam",
+                            type="preferred_hours",
+                            priority="hard",
+                            time_scope=scope,
+                        )
+                    ]
+                )
+            )
 
+    def test_relative_dates_cross_year_and_leap_day(self) -> None:
         cases = (
             (date(2026, 12, 31), date(2027, 1, 1)),
             (date(2028, 2, 28), date(2028, 2, 29)),
@@ -93,28 +138,17 @@ class SyntheticDataTests(unittest.TestCase):
                 priorities=("hard",),
                 one_off_offsets=(1,),
             )
-            text, _ = render_scenario(scenario, "preview", random.Random(8))
-            self.assertIn("tomorrow", text.lower())
+            text, _, _ = render_scenario(scenario, random.Random(8))
+            self.assertTrue(text)
             self.assertEqual(
                 scenario.output.constraints[0].time_scope.start_date,
                 expected_date,
             )
 
-    def test_audit_rejects_duplicate_and_held_out_train_records(self) -> None:
+    def test_audit_rejects_duplicates(self) -> None:
         records, _ = build_preview(321)
         with self.assertRaisesRegex(ValueError, "Duplicate request"):
             audit_splits({"train": [records[0]], "validation": [records[0]]})
-
-        held_out = next(
-            record
-            for record in records
-            if combination_key(
-                [item["type"] for item in record["label"]["constraints"]]
-            )
-            in HELD_OUT_KEYS
-        )
-        with self.assertRaisesRegex(ValueError, "Held-out combination"):
-            audit_splits({"train": [held_out]})
 
     def test_full_write_requires_approval_and_preview(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
