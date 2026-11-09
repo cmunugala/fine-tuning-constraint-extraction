@@ -31,9 +31,10 @@ After manually approving the preview, run:
 python -m synthetic_data generate --seed 20261102 --output-dir data --approved-preview
 ```
 
-This writes `train.jsonl` (1,000 rows), `val.jsonl` (150 rows),
-`test.jsonl` (200 rows), and `dataset_manifest.json`. The command refuses to run
-without both the approval flag and an existing valid 20-row preview.
+This first generates and validates one pool of 1,350 unique rows, then applies a
+seeded random shuffle and writes `train.jsonl` (1,000 rows), `val.jsonl` (175
+rows), `test.jsonl` (175 rows), and `dataset_manifest.json`. The command refuses
+to run without both the approval flag and an existing valid 20-row preview.
 
 Validate existing outputs with:
 
@@ -47,7 +48,8 @@ Run the tests with:
 python -m unittest discover -s tests -v
 ```
 
-The final splits use disjoint phrasing-template banks. Thirty percent of test
-examples use constraint combinations held out of train and validation, and the
-pipeline rejects duplicate normalized requests or canonical labels across
-splits.
+All splits use the same diverse, composable language generator. It varies
+register, sentence structure, connectors, shorthand, dates, and clock formats;
+the split assignment is independent of those choices. The pipeline rejects
+duplicate normalized requests or canonical labels across the entire pool and
+reports structural-diversity statistics in the manifest.

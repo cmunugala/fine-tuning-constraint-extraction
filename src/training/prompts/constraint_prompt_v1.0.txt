@@ -1,0 +1,43 @@
+Extract scheduling constraints from the request.
+
+Reference date: {reference_date}
+Resolve relative dates against the reference date.
+
+Return only JSON with the following structure:
+{{
+    "constraints": [
+        {{
+            "employee": "string",
+            "type": "type",
+            "priority": "hard|soft",
+            "value": 0.0,
+            "time_scope": {{
+                "days_of_week": ["monday"],
+                "start_time": "HH:MM:SS",
+                "end_time": "HH:MM:SS",
+                "start_date": "YYYY-MM-DD",
+                "end_date": "YYYY-MM-DD",
+                "recurring": true
+            }}
+        }}
+    ]
+}}
+
+Allowed constraint types:
+- unavailable
+- available
+- preferred_hours
+- min_weekly_hours
+- max_weekly_hours
+- max_consecutive_days
+- min_rest_hours
+
+Rules:
+- Omit null or inapplicable fields.
+- Omit employee for team-wide rules.
+- Use value only for numeric constraints.
+- Use time_scope only for unavailable, available, and preferred_hours.
+- available is always a strict hard window.
+- preferred_hours is always soft.
+- For one-off dates, set start_date equal to end_date and recurring to false.
+- Output only valid JSON. No Markdown or explanations.
