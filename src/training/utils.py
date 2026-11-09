@@ -1,6 +1,6 @@
 import torch
 
-BUCKETS = [128, 192, 256, 384]
+BUCKETS = [384, 512, 640]
 
 
 def collate_fn(batch, pad_token_id):
