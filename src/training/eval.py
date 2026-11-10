@@ -39,6 +39,18 @@ def load_model(fine_tuned=False):
     return model
 
 
+def parse_json(text):
+    try:
+        text = text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            text = text.rsplit("```", 1)[0].strip()
+        return json.loads(text)
+
+    except (json.JSONDecodeError, IndexError, AttributeError):
+        return None
+
+
 def generate_prediction(model, tokenizer, example):
     messages = [
         {
@@ -81,24 +93,20 @@ def generate_prediction(model, tokenizer, example):
 
 
 def parse_prediction(text):
-    try:
-        prediction = json.loads(text)
+    prediction = parse_json(text)
 
-        if not isinstance(prediction, dict):
-            return None
-
-        constraints = prediction.get("constraints")
-
-        if not isinstance(constraints, list):
-            return None
-
-        if not all(isinstance(c, dict) for c in constraints):
-            return None
-
-        return prediction
-
-    except json.JSONDecodeError:
+    if not isinstance(prediction, dict):
         return None
+
+    constraints = prediction.get("constraints")
+
+    if not isinstance(constraints, list):
+        return None
+
+    if not all(isinstance(c, dict) for c in constraints):
+        return None
+
+    return prediction
 
 
 def normalize(value):
